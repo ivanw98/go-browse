@@ -33,6 +33,9 @@ const (
 	data  Scheme = "data"
 )
 
+// Fallback socket lifetime when the server sends no Keep-Alive: timeout.
+const defaultKeepAlive = 5 * time.Second
+
 type URL struct {
 	Scheme     Scheme
 	Host       string
@@ -124,6 +127,52 @@ func NewURL(rawURL string) (*URL, error) {
 	u.Path = path
 
 	return u, nil
+}
+
+func readChunked(r *bufio.Reader) ([]byte, error) {
+	var body []byte
+	for {
+		sizeLine, err := r.ReadString('\n')
+		if err != nil {
+			return nil, fmt.Errorf("failed to read chunk size: %w", err)
+		}
+		sizeField := strings.TrimSpace(strings.SplitN(sizeLine, ";", 2)[0])
+		size, err := strconv.ParseInt(sizeField, 16, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid chunk size %q: %w", sizeField, err)
+		}
+		if size == 0 {
+			for {
+				trailer, err := r.ReadString('\n')
+				if err != nil {
+					return nil, fmt.Errorf("failed to read trailer: %w", err)
+				}
+				if trailer == "\r\n" || trailer == "\n" {
+					break
+				}
+			}
+			break
+		}
+		chunk := make([]byte, size)
+		if _, err := io.ReadFull(r, chunk); err != nil {
+			return nil, fmt.Errorf("failed to read chunk body: %w", err)
+		}
+		body = append(body, chunk...)
+		if _, err := r.Discard(2); err != nil { // CRLF after the chunk data
+			return nil, fmt.Errorf("failed to read chunk terminator: %w", err)
+		}
+	}
+	return body, nil
+}
+
+func socketLifetime(headers map[string]string) time.Time {
+	if ka := headers["keep-alive"]; strings.Contains(ka, "timeout=") {
+		field := strings.Split(ka, "timeout=")[1]
+		if secs, err := strconv.Atoi(strings.Split(field, ",")[0]); err == nil {
+			return time.Now().Add(time.Duration(secs) * time.Second)
+		}
+	}
+	return time.Now().Add(defaultKeepAlive)
 }
 
 func (u *URL) Request(ctx context.Context, maxRedirects int) (string, error) {
@@ -246,26 +295,26 @@ func (u *URL) Request(ctx context.Context, maxRedirects int) (string, error) {
 		return redirectURL.Request(ctx, maxRedirects-1)
 	}
 
-	expiry := time.Time{} // zero value = don't cache
+	if !strings.EqualFold(responseHeaders["connection"], "close") {
+		socketExpiry := socketLifetime(responseHeaders)
+		socketCache.mu.Lock()
+		socketCache.conns[ck] = struct {
+			conn   net.Conn
+			expiry time.Time
+		}{conn: conn, expiry: socketExpiry}
+		socketCache.mu.Unlock()
+	}
 
+	cacheExpiry := time.Time{} // zero value = don't cache
 	cacheControl := responseHeaders["cache-control"]
 	if strings.Contains(cacheControl, "max-age=") {
 		parts := strings.Split(cacheControl, "max-age=")
 		maxAge, err := strconv.Atoi(strings.Split(parts[1], ",")[0])
 		if err == nil {
-			expiry = time.Now().Add(time.Duration(maxAge) * time.Second)
+			cacheExpiry = time.Now().Add(time.Duration(maxAge) * time.Second)
 		}
 	}
-	// no-store or unknown: expiry stays zero = don't cache
-
-	if !expiry.IsZero() {
-		socketCache.mu.Lock()
-		socketCache.conns[ck] = struct {
-			conn   net.Conn
-			expiry time.Time
-		}{conn: conn, expiry: expiry}
-		socketCache.mu.Unlock()
-	}
+	// no-store or unknown: cacheExpiry stays zero = don't cache
 
 	var content []byte
 	if responseHeaders["transfer-encoding"] == "chunked" {
@@ -298,47 +347,11 @@ func (u *URL) Request(ctx context.Context, maxRedirects int) (string, error) {
 
 	result := string(content)
 
-	if status == "200" && !expiry.IsZero() {
+	if status == "200" && !cacheExpiry.IsZero() {
 		responseCache.mu.Lock()
-		responseCache.entries[respKey] = responseCacheEntry{body: result, expiry: expiry}
+		responseCache.entries[respKey] = responseCacheEntry{body: result, expiry: cacheExpiry}
 		responseCache.mu.Unlock()
 	}
 
 	return result, nil
-}
-
-func readChunked(r *bufio.Reader) ([]byte, error) {
-	var body []byte
-	for {
-		sizeLine, err := r.ReadString('\n')
-		if err != nil {
-			return nil, fmt.Errorf("failed to read chunk size: %w", err)
-		}
-		sizeField := strings.TrimSpace(strings.SplitN(sizeLine, ";", 2)[0])
-		size, err := strconv.ParseInt(sizeField, 16, 64)
-		if err != nil {
-			return nil, fmt.Errorf("invalid chunk size %q: %w", sizeField, err)
-		}
-		if size == 0 {
-			for {
-				trailer, err := r.ReadString('\n')
-				if err != nil {
-					return nil, fmt.Errorf("failed to read trailer: %w", err)
-				}
-				if trailer == "\r\n" || trailer == "\n" {
-					break
-				}
-			}
-			break
-		}
-		chunk := make([]byte, size)
-		if _, err := io.ReadFull(r, chunk); err != nil {
-			return nil, fmt.Errorf("failed to read chunk body: %w", err)
-		}
-		body = append(body, chunk...)
-		if _, err := r.Discard(2); err != nil { // CRLF after the chunk data
-			return nil, fmt.Errorf("failed to read chunk terminator: %w", err)
-		}
-	}
-	return body, nil
 }
