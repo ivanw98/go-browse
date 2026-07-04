@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"go-browse/internal/network"
 	"os"
 	"strings"
 )
@@ -13,7 +14,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "usage: %s <url>\n", os.Args[0])
 		os.Exit(1)
 	}
-	u, err := NewURL(os.Args[1])
+	u, err := network.NewURL(os.Args[1])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -25,8 +26,8 @@ func main() {
 	}
 }
 
-func load(url *URL, ctx context.Context) error {
-	body, err := url.Request(ctx)
+func load(url *network.URL, ctx context.Context) error {
+	body, err := url.Request(ctx, 10)
 	if err != nil {
 		return err
 	}

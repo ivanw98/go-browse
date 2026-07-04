@@ -1,4 +1,4 @@
-package main
+package network
 
 import (
 	"bufio"
@@ -33,7 +33,6 @@ const (
 	data  Scheme = "data"
 )
 
-// Fallback socket lifetime when the server sends no Keep-Alive: timeout.
 const defaultKeepAlive = 5 * time.Second
 
 type URL struct {
@@ -48,10 +47,12 @@ var socketCache = struct {
 	mu    sync.Mutex
 	conns map[string]struct {
 		conn   net.Conn
+		reader *bufio.Reader
 		expiry time.Time
 	}
 }{conns: make(map[string]struct {
 	conn   net.Conn
+	reader *bufio.Reader
 	expiry time.Time
 })}
 
@@ -67,6 +68,7 @@ var responseCache = struct {
 
 func NewURL(rawURL string) (*URL, error) {
 	u := &URL{}
+
 	if strings.HasPrefix(rawURL, "view-source:") {
 		u.ViewSource = true
 		rawURL = strings.TrimPrefix(rawURL, "view-source:")
@@ -82,6 +84,7 @@ func NewURL(rawURL string) (*URL, error) {
 	if len(parts) != 2 {
 		return nil, fmt.Errorf("invalid URL: missing scheme")
 	}
+
 	scheme := parts[0]
 	rest := parts[1]
 
@@ -96,14 +99,14 @@ func NewURL(rawURL string) (*URL, error) {
 	}
 
 	if !strings.Contains(rest, "/") {
-		rest = rest + "/"
+		rest += "/"
 	}
 
 	slashIdx := strings.Index(rest, "/")
 	host := rest[:slashIdx]
 	path := rest[slashIdx:]
 
-	var port int
+	port := 0
 	switch scheme {
 	case "http":
 		port = 80
@@ -131,16 +134,19 @@ func NewURL(rawURL string) (*URL, error) {
 
 func readChunked(r *bufio.Reader) ([]byte, error) {
 	var body []byte
+
 	for {
 		sizeLine, err := r.ReadString('\n')
 		if err != nil {
 			return nil, fmt.Errorf("failed to read chunk size: %w", err)
 		}
+
 		sizeField := strings.TrimSpace(strings.SplitN(sizeLine, ";", 2)[0])
 		size, err := strconv.ParseInt(sizeField, 16, 64)
 		if err != nil {
 			return nil, fmt.Errorf("invalid chunk size %q: %w", sizeField, err)
 		}
+
 		if size == 0 {
 			for {
 				trailer, err := r.ReadString('\n')
@@ -153,15 +159,19 @@ func readChunked(r *bufio.Reader) ([]byte, error) {
 			}
 			break
 		}
+
 		chunk := make([]byte, size)
 		if _, err := io.ReadFull(r, chunk); err != nil {
 			return nil, fmt.Errorf("failed to read chunk body: %w", err)
 		}
+
 		body = append(body, chunk...)
-		if _, err := r.Discard(2); err != nil { // CRLF after the chunk data
+
+		if _, err := r.Discard(2); err != nil {
 			return nil, fmt.Errorf("failed to read chunk terminator: %w", err)
 		}
 	}
+
 	return body, nil
 }
 
@@ -173,6 +183,19 @@ func socketLifetime(headers map[string]string) time.Time {
 		}
 	}
 	return time.Now().Add(defaultKeepAlive)
+}
+
+func isPersistentHTTP(version string, headers map[string]string) bool {
+	connection := strings.ToLower(strings.TrimSpace(headers["connection"]))
+
+	switch version {
+	case "HTTP/1.1":
+		return connection != "close"
+	case "HTTP/1.0":
+		return connection == "keep-alive"
+	default:
+		return false
+	}
 }
 
 func (u *URL) Request(ctx context.Context, maxRedirects int) (string, error) {
@@ -189,10 +212,11 @@ func (u *URL) Request(ctx context.Context, maxRedirects int) (string, error) {
 		if !found {
 			return "", fmt.Errorf("invalid data URL: missing comma")
 		}
-		return content + "\n", nil
+		return content, nil
 	}
 
 	respKey := fmt.Sprintf("%s://%s:%d%s", u.Scheme, u.Host, u.Port, u.Path)
+
 	responseCache.mu.Lock()
 	if entry, ok := responseCache.entries[respKey]; ok {
 		if time.Now().Before(entry.expiry) {
@@ -205,37 +229,45 @@ func (u *URL) Request(ctx context.Context, maxRedirects int) (string, error) {
 
 	portStr := strconv.Itoa(u.Port)
 	ck := net.JoinHostPort(u.Host, portStr)
+
 	socketCache.mu.Lock()
 	cached, ok := socketCache.conns[ck]
 	socketCache.mu.Unlock()
 
 	var conn net.Conn
+	var reader *bufio.Reader
+
 	if ok {
 		if cached.expiry.IsZero() || time.Now().After(cached.expiry) {
 			socketCache.mu.Lock()
 			delete(socketCache.conns, ck)
 			socketCache.mu.Unlock()
+			cached.conn.Close()
 			ok = false
 		} else {
 			conn = cached.conn
+			reader = cached.reader
 		}
 	}
+
 	if !ok {
 		var err error
-		newConn := new(net.Dialer)
-		conn, err = newConn.DialContext(ctx, "tcp", net.JoinHostPort(u.Host, strconv.Itoa(u.Port)))
+		dialer := new(net.Dialer)
+		conn, err = dialer.DialContext(ctx, "tcp", ck)
 		if err != nil {
-			return "", fmt.Errorf("failed to connect to the address on the named network: %q", err.Error())
+			return "", fmt.Errorf("failed to connect to network: %w", err)
 		}
 
 		if u.Scheme == https {
 			tlsConn := tls.Client(conn, &tls.Config{ServerName: u.Host})
-			if err := tlsConn.Handshake(); err != nil {
+			if err := tlsConn.HandshakeContext(ctx); err != nil {
+				conn.Close()
 				return "", fmt.Errorf("TLS handshake failed: %w", err)
 			}
-
 			conn = tlsConn
 		}
+
+		reader = bufio.NewReader(conn)
 	}
 
 	request := fmt.Sprintf(
@@ -244,112 +276,159 @@ func (u *URL) Request(ctx context.Context, maxRedirects int) (string, error) {
 	)
 
 	if _, err := conn.Write([]byte(request)); err != nil {
+		conn.Close()
 		return "", fmt.Errorf("failed to send request: %w", err)
 	}
 
-	reader := bufio.NewReader(conn)
 	statusLine, err := reader.ReadString('\n')
 	if err != nil {
+		conn.Close()
 		return "", fmt.Errorf("failed to read status line: %w", err)
 	}
 
 	parts := strings.SplitN(strings.TrimRight(statusLine, "\r\n"), " ", 3)
-	// returns ["HTTP/1.0", "200", "OK"]
-	// version, status, explanation := parts[0], parts[1], parts[2]
 	if len(parts) != 3 {
+		conn.Close()
 		return "", fmt.Errorf("malformed status line: %q", statusLine)
 	}
 
-	responseHeaders := map[string]string{}
+	version := parts[0]
+	status := parts[1]
 
+	responseHeaders := map[string]string{}
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
+			conn.Close()
 			return "", fmt.Errorf("failed to read headers: %w", err)
 		}
-
 		if line == "\r\n" {
 			break
 		}
 
 		header, value, found := strings.Cut(line, ":")
 		if !found {
+			conn.Close()
 			return "", fmt.Errorf("malformed header: %q", line)
 		}
-		responseHeaders[strings.ToLower(header)] = strings.TrimSpace(value)
+
+		responseHeaders[strings.ToLower(strings.TrimSpace(header))] = strings.TrimSpace(value)
 	}
 
-	status := parts[1]
 	if strings.HasPrefix(status, "3") {
 		if maxRedirects == 0 {
+			conn.Close()
 			return "", fmt.Errorf("too many redirects")
 		}
+
 		location := responseHeaders["location"]
 		if strings.HasPrefix(location, "/") {
 			location = fmt.Sprintf("%s://%s%s", u.Scheme, u.Host, location)
 		}
+
 		redirectURL, err := NewURL(location)
 		if err != nil {
+			conn.Close()
 			return "", fmt.Errorf("invalid redirect location: %w", err)
 		}
+
 		return redirectURL.Request(ctx, maxRedirects-1)
 	}
 
-	if !strings.EqualFold(responseHeaders["connection"], "close") {
+	te := responseHeaders["transfer-encoding"]
+	if te != "" && te != "chunked" {
+		conn.Close()
+		return "", fmt.Errorf("unsupported transfer-encoding: %s", te)
+	}
+
+	ce := responseHeaders["content-encoding"]
+	if ce != "" && ce != "gzip" {
+		conn.Close()
+		return "", fmt.Errorf("unsupported content-encoding: %s", ce)
+	}
+
+	var content []byte
+	canReuseSocket := true
+
+	if te == "chunked" {
+		content, err = readChunked(reader)
+		if err != nil {
+			conn.Close()
+			return "", err
+		}
+	} else if clStr, hasCL := responseHeaders["content-length"]; hasCL {
+		contentLength, err := strconv.Atoi(clStr)
+		if err != nil {
+			conn.Close()
+			return "", fmt.Errorf("invalid content-length: %w", err)
+		}
+
+		content = make([]byte, contentLength)
+		if _, err := io.ReadFull(reader, content); err != nil {
+			conn.Close()
+			return "", fmt.Errorf("failed to read body: %w", err)
+		}
+	} else {
+		content, err = io.ReadAll(reader)
+		if err != nil && err != io.EOF {
+			conn.Close()
+			return "", fmt.Errorf("failed to read until EOF: %w", err)
+		}
+		canReuseSocket = false
+	}
+
+	if ce == "gzip" {
+		gz, err := gzip.NewReader(bytes.NewReader(content))
+		if err != nil {
+			conn.Close()
+			return "", fmt.Errorf("failed to init gzip reader: %w", err)
+		}
+
+		content, err = io.ReadAll(gz)
+		gz.Close()
+		if err != nil {
+			conn.Close()
+			return "", fmt.Errorf("failed to decompress body: %w", err)
+		}
+	}
+
+	if canReuseSocket && isPersistentHTTP(version, responseHeaders) {
 		socketExpiry := socketLifetime(responseHeaders)
 		socketCache.mu.Lock()
 		socketCache.conns[ck] = struct {
 			conn   net.Conn
+			reader *bufio.Reader
 			expiry time.Time
-		}{conn: conn, expiry: socketExpiry}
+		}{
+			conn:   conn,
+			reader: reader,
+			expiry: socketExpiry,
+		}
 		socketCache.mu.Unlock()
+	} else {
+		conn.Close()
 	}
 
-	cacheExpiry := time.Time{} // zero value = don't cache
+	result := strings.ToValidUTF8(string(content), "\uFFFD")
+
+	cacheExpiry := time.Time{}
 	cacheControl := responseHeaders["cache-control"]
 	if strings.Contains(cacheControl, "max-age=") {
-		parts := strings.Split(cacheControl, "max-age=")
-		maxAge, err := strconv.Atoi(strings.Split(parts[1], ",")[0])
-		if err == nil {
-			cacheExpiry = time.Now().Add(time.Duration(maxAge) * time.Second)
-		}
-	}
-	// no-store or unknown: cacheExpiry stays zero = don't cache
-
-	var content []byte
-	if responseHeaders["transfer-encoding"] == "chunked" {
-		content, err = readChunked(reader)
-		if err != nil {
-			return "", err
-		}
-	} else {
-		contentLength, err := strconv.Atoi(responseHeaders["content-length"])
-		if err != nil {
-			return "", fmt.Errorf("missing or invalid content-length: %w", err)
-		}
-		content = make([]byte, contentLength)
-		if _, err := io.ReadFull(reader, content); err != nil {
-			return "", fmt.Errorf("failed to read body: %w", err)
+		cacheParts := strings.Split(cacheControl, "max-age=")
+		if len(cacheParts) > 1 {
+			maxAgeStr := strings.Split(cacheParts[1], ",")[0]
+			if maxAge, err := strconv.Atoi(strings.TrimSpace(maxAgeStr)); err == nil {
+				cacheExpiry = time.Now().Add(time.Duration(maxAge) * time.Second)
+			}
 		}
 	}
 
-	if responseHeaders["content-encoding"] == "gzip" {
-		gz, err := gzip.NewReader(bytes.NewReader(content))
-		if err != nil {
-			return "", fmt.Errorf("failed to init gzip reader: %w", err)
-		}
-		content, err = io.ReadAll(gz)
-		if err != nil {
-			return "", fmt.Errorf("failed to decompress body: %w", err)
-		}
-		gz.Close()
-	}
-
-	result := string(content)
-
-	if status == "200" && !cacheExpiry.IsZero() {
+	if status == "200" && !cacheExpiry.IsZero() && !strings.Contains(cacheControl, "no-store") {
 		responseCache.mu.Lock()
-		responseCache.entries[respKey] = responseCacheEntry{body: result, expiry: cacheExpiry}
+		responseCache.entries[respKey] = responseCacheEntry{
+			body:   result,
+			expiry: cacheExpiry,
+		}
 		responseCache.mu.Unlock()
 	}
 
